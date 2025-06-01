@@ -1,17 +1,19 @@
 from fastapi import FastAPI, HTTPException, Depends
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, ForeignKey
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from pydantic import BaseModel
 from typing import List, Optional
 import datetime
 import logging
 
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Инициализация FastAPI
 app = FastAPI()
 
+# Конфигурация базы данных
 DATABASE_URL = "postgresql://postgres:dfvgbh1q2w3e@localhost/expressDB"
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -33,7 +35,7 @@ class Product(Base):
     name = Column(String(100), nullable=False)
     price = Column(Float, nullable=False)
     description = Column(String)
-    image_url = Column(String(255))  # Новое поле для URL изображения
+    image_url = Column(String(255))
 
 class Order(Base):
     __tablename__ = "orders"
@@ -57,26 +59,38 @@ class Credentials(BaseModel):
     email: str
     name: str
 
+    class Config:
+        from_attributes = True
+
 class ProductModel(BaseModel):
     id: int
     name: str
     price: float
     description: Optional[str] = None
-    image_url: Optional[str] = None  # Новое поле
+    image_url: Optional[str] = None
+
+    class Config:
+        from_attributes = True
 
 class CartItemModel(BaseModel):
     product: ProductModel
     quantity: int
+
+    class Config:
+        from_attributes = True
 
 class OrderModel(BaseModel):
     items: List[CartItemModel]
     address: str
     total: float
 
-# Создание таблиц
-Base.metadata.drop_all(bind=engine)  # Удаляем старые таблицы
+    class Config:
+        from_attributes = True
+
+# Создание таблиц (без удаления)
 Base.metadata.create_all(bind=engine)
 
+# Зависимость для получения сессии БД
 def get_db():
     db = SessionLocal()
     try:
@@ -87,19 +101,22 @@ def get_db():
 @app.post("/register")
 async def register(credentials: Credentials, db: Session = Depends(get_db)):
     if db.query(User).filter(User.username == credentials.username).first():
+        logger.error(f"Registration failed: Username {credentials.username} already exists")
         raise HTTPException(status_code=400, detail="Имя пользователя занято")
     if db.query(User).filter(User.email == credentials.email).first():
+        logger.error(f"Registration failed: Email {credentials.email} already exists")
         raise HTTPException(status_code=400, detail="Электронная почта уже зарегистрирована")
 
     new_user = User(
         username=credentials.username,
-        password=credentials.password,
+        password=credentials.password,  # Без хэширования
         phone=credentials.phone,
         email=credentials.email,
         name=credentials.name
     )
     db.add(new_user)
     db.commit()
+    db.refresh(new_user)
     logger.info(f"User registered: {credentials.username}")
     return {"message": "Регистрация успешна"}
 
@@ -107,6 +124,7 @@ async def register(credentials: Credentials, db: Session = Depends(get_db)):
 async def login(credentials: Credentials, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.username == credentials.username).first()
     if not user or user.password != credentials.password:
+        logger.error(f"Login failed for {credentials.username}: Invalid credentials")
         raise HTTPException(status_code=401, detail="Неверные данные")
     logger.info(f"User logged in: {credentials.username}")
     return {"access_token": user.username}
@@ -115,39 +133,29 @@ async def login(credentials: Credentials, db: Session = Depends(get_db)):
 async def get_products(db: Session = Depends(get_db)):
     products = db.query(Product).all()
     logger.info(f"Returning {len(products)} products")
-    return [{"id": p.id, "name": p.name, "price": p.price, "description": p.description, "image_url": p.image_url} for p in products]
+    return products
 
 @app.post("/order", response_model=OrderModel)
 async def place_order(order: OrderModel, db: Session = Depends(get_db)):
     if not order.items or not order.address or order.total is None:
+        logger.error("Order failed: Missing required fields")
         raise HTTPException(status_code=400, detail="Отсутствуют обязательные поля")
 
     db_order = Order(address=order.address, total=order.total)
     db.add(db_order)
     db.commit()
+    db.refresh(db_order)
 
     for item in order.items:
-        db_order_item = OrderItem(order_id=db_order.id, product_id=item.product.id, quantity=item.quantity)
+        db_order_item = OrderItem(
+            order_id=db_order.id,
+            product_id=item.product.id,
+            quantity=item.quantity
+        )
         db.add(db_order_item)
-
     db.commit()
     logger.info(f"Order placed with ID: {db_order.id}")
-    return {
-        "items": [
-            {
-                "product": {
-                    "id": db.query(Product).get(item.product_id).id,
-                    "name": db.query(Product).get(item.product_id).name,
-                    "price": db.query(Product).get(item.product_id).price,
-                    "description": db.query(Product).get(item.product_id).description,
-                    "image_url": db.query(Product).get(item.product_id).image_url
-                },
-                "quantity": item.quantity
-            } for item in db.query(OrderItem).filter(OrderItem.order_id == db_order.id).all()
-        ],
-        "address": db_order.address,
-        "total": db_order.total
-    }
+    return order
 
 if __name__ == "__main__":
     import uvicorn
